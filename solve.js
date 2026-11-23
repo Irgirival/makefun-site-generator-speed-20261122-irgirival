@@ -31,11 +31,10 @@ function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
-const ESC_TEST = /[&<>"']/;
-
-/** `text` escaped, skipping the replace entirely when nothing needs it (the common case for template values). */
+/** `text` escaped, skipping the replace entirely when nothing needs it (the common case for template values). The check is five indexOf calls: measurably faster than one regex test on the same strings. */
 function escapeHtmlChecked(text) {
-  return ESC_TEST.test(text) ? text.replace(/[&<>"']/g, (c) => ESCAPES[c]) : text;
+  if (text.indexOf('&') === -1 && text.indexOf('<') === -1 && text.indexOf('>') === -1 && text.indexOf('"') === -1 && text.indexOf("'") === -1) return text;
+  return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
 /** The slug of `text`: NFKD, combining marks dropped, A-Z lowered, every run
@@ -77,51 +76,21 @@ function longDateRaw(date) {
   return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
 }
 
-/** Whether a UTF-16 code unit is whitespace under /\s/ (no `u` flag). */
-function isWS(code) {
-  if (code >= 33 && code < 127) return false;
-  if (code <= 32) return code === 9 || code === 10 || code === 11 || code === 12 || code === 13 || code === 32;
-  return (
-    code === 160 ||
-    code === 0x1680 ||
-    (code >= 0x2000 && code <= 0x200a) ||
-    code === 0x2028 ||
-    code === 0x2029 ||
-    code === 0x202f ||
-    code === 0x205f ||
-    code === 0x3000 ||
-    code === 0xfeff
-  );
-}
-
-/** Any whitespace other than ' ' and '\n' (see /\s/ without the `u` flag). */
-const OTHER_WS = /[\t\r\f\v\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/;
-
-/** The words of `text`: its runs of characters other than whitespace. */
+/** The words of `text`: its runs of characters other than whitespace (/\s/ without the `u` flag). One pass, no pre-scan: the common ASCII lane is two comparisons per character, and only a code unit at or above 160 can be one of the Unicode spaces. */
 function wordsOf(text) {
-  if (!OTHER_WS.test(text)) {
-    // Only ' ' and '\n' can be whitespace here: a tight loop.
-    let n = 0;
-    let inWord = false;
-    for (let i = 0; i < text.length; i++) {
-      const c = text.charCodeAt(i);
-      if (c === 32 || c === 10) inWord = false;
-      else if (!inWord) {
-        n++;
-        inWord = true;
-      }
-    }
-    return n;
-  }
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (!isWS(text.charCodeAt(i))) {
-      if (!inWord) {
-        n++;
-        inWord = true;
-      }
-    } else inWord = false;
+    const c = text.charCodeAt(i);
+    let ws;
+    if (c <= 32) ws = c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13;
+    else if (c < 160) ws = false;
+    else ws = c === 160 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+    if (ws) inWord = false;
+    else if (!inWord) {
+      n++;
+      inWord = true;
+    }
   }
   return n;
 }
@@ -434,9 +403,19 @@ function renderNodes(nodes, scope, depth, parts) {
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
+        // One vars object, one loop record and one child scope for the
+        // whole loop: rendering is synchronous and nothing retains them,
+        // so mutating them per item is safe and saves two allocations
+        // per item (index pages loop over hundreds of cards).
+        const loop = { index: 0, first: true, last: false, length: xs.length };
+        const vars = { [n.name]: undefined, loop };
+        const child = { vars, parent: scope };
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(n.body, { vars, parent: scope }, depth, parts);
+          vars[n.name] = xs[k];
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
+          renderNodes(n.body, child, depth, parts);
         }
         break;
       }
@@ -908,21 +887,46 @@ function renderMD(src, link) {
       blocks.push(out);
       continue;
     }
+    // A one-line paragraph whose line needs no trimming is rendered
+    // straight from the source range: no trim slice, no line array, no join.
+    const firstLs = ls;
+    const firstLe = le;
+    let single = true;
     const plines = [trimLine(src, ls, le)];
     pos = le + 1;
     while (pos < n) {
       ls = pos;
       le = src.indexOf('\n', ls);
       if (le === -1) le = n;
+      // A line can only end a paragraph when it is blank, a fence, a
+      // heading or a thematic break, so any other first character means
+      // the line continues it: skip the four detectors for those lines.
+      if (le > ls) {
+        const c0 = src[ls];
+        if (c0 !== ' ' && c0 !== '\t' && c0 !== '`' && c0 !== '#' && c0 !== '-' && c0 !== '*') {
+          plines.push(trimLine(src, ls, le));
+          pos = le + 1;
+          single = false;
+          continue;
+        }
+      }
       if (endsParagraph(src, ls, le)) break;
       plines.push(trimLine(src, ls, le));
       pos = le + 1;
+      single = false;
     }
-    const html = inlineStr(plines.join('\n'), link);
+    let html;
+    if (single && src[firstLs] !== ' ' && src[firstLs] !== '\t' && src[firstLe - 1] !== ' ' && src[firstLe - 1] !== '\t') {
+      const parts = [];
+      inlineInto(src, firstLs, firstLe, link, parts);
+      html = parts.join('');
+    } else {
+      html = inlineStr(plines.join('\n'), link);
+    }
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- the build
